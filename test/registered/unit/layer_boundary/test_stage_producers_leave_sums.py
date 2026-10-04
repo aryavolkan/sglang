@@ -42,6 +42,18 @@ _BUILDS_STAGES = (
 )
 
 
+# Producers whose stage declares output_complete: the sum these functions run
+# is one the computation needs anyway, and the stage output's sum rides with
+# it. Kimi K3's latent MoE reduces the latent before its norm, completing the
+# routed output, and completes the shared experts' sum beside it (in the same
+# collective on the fused front).
+_COMPLETES_OWN_SUM = {
+    "kimi_k3.py": frozenset(
+        {"_reduce_latent", "_reduce_shared", "_reduce_latent_and_shared"}
+    ),
+}
+
+
 # A vocabulary-parallel lookup leaves each rank holding only its own shard's
 # rows, so the class completes that sum itself. An embedding is never a decoder
 # stage, so no sum inside one is a stage output and the whole class is exempt.
@@ -84,15 +96,18 @@ def _reduce_results_names(tree) -> set:
     return names
 
 
-def _unguarded_sums(source: str):
+def _unguarded_sums(source: str, completes_own_sum=frozenset()):
     """Sum calls not under ``if ... self.reduce_results ...``: such a branch is
     a shared class built without stage boundaries by another model. Sums inside
-    a vocabulary-parallel embedding complete its lookup, not a stage output."""
+    a vocabulary-parallel embedding complete its lookup, not a stage output,
+    and the named functions belong to a producer that completes its own."""
     found = []
     guards = _reduce_results_names(ast.parse(source))
 
     def visit(node, guarded):
         if _is_vocab_parallel(node):
+            return
+        if isinstance(node, ast.FunctionDef) and node.name in completes_own_sum:
             return
         if isinstance(node, ast.If) and _requires(node.test, guards):
             for child in node.body:
@@ -118,7 +133,12 @@ class TestStageProducersLeaveSums(CustomTestCase):
             if not any(marker in source for marker in _BUILDS_STAGES):
                 continue
             checked += 1
-            if sums := _unguarded_sums(source):
+            exempt = _COMPLETES_OWN_SUM.get(path.name, frozenset())
+            if exempt and "output_complete=" not in source:
+                offenders[str(path.relative_to(models))] = [
+                    "exempt sums, but no stage declares output_complete"
+                ]
+            elif sums := _unguarded_sums(source, exempt):
                 offenders[str(path.relative_to(models))] = sums
         self.assertGreater(checked, 30)
         self.assertEqual(offenders, {})
@@ -148,6 +168,19 @@ class TestStageProducersLeaveSums(CustomTestCase):
                 "12: moe_finalize_all_reduce(x)",
                 "14: tensor_model_parallel_all_reduce(x)",
             ],
+        )
+
+    def test_only_the_named_functions_of_a_completing_producer_are_exempt(self):
+        source = (
+            "class MoE:\n"
+            "    def _reduce_latent(self, x):\n"
+            "        return tensor_model_parallel_all_reduce(x)\n"
+            "    def forward(self, x):\n"
+            "        return tensor_model_parallel_all_reduce(x)\n"
+        )
+        self.assertEqual(
+            _unguarded_sums(source, frozenset({"_reduce_latent"})),
+            ["5: tensor_model_parallel_all_reduce(x)"],
         )
 
     def test_guard_rejects_a_producer_that_sums_its_own_output(self):
