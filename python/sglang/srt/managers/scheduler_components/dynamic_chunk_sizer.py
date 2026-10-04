@@ -197,28 +197,22 @@ class DynamicChunkSizer:
                 batch.global_num_tokens = global_num_tokens
                 batch.global_num_tokens_for_logprob = global_num_tokens
 
-            hs = (
-                getattr(model_config, "hc_hidden_size", None)
-                or model_config.hidden_size
+            from sglang.srt.model_executor.runner_utils.buffers import (
+                _allocate_pp_proxy_tensors,
             )
-            proxy_tensors = {
-                "hidden_states": torch.zeros(
-                    (current_seq_len, hs),
+
+            # The same tensors, by key and shape, as the runner's PP buffers.
+            with torch.device(self.device):
+                proxy_tensors = _allocate_pp_proxy_tensors(
+                    max_num_tokens=current_seq_len,
+                    max_hidden_tokens=current_seq_len,
+                    hidden_size=model_config.hidden_size,
                     dtype=model_config.dtype,
-                    device=self.device,
-                ),
-                "residual": torch.zeros(
-                    (current_seq_len, model_config.hidden_size),
-                    dtype=model_config.dtype,
-                    device=self.device,
-                ),
-            }
-            pp_proxy_topk_size = model_runner.get_pp_proxy_topk_size()
-            if pp_proxy_topk_size is not None:
-                proxy_tensors["topk_indices"] = torch.zeros(
-                    (current_seq_len, pp_proxy_topk_size),
-                    dtype=torch.int32,
-                    device=self.device,
+                    hc_hidden_size=getattr(model_config, "hc_hidden_size", None),
+                    pp_proxy_topk_size=model_runner.get_pp_proxy_topk_size(),
+                    pp_proxy_residual_num_blocks=(
+                        model_runner.get_pp_proxy_residual_num_blocks()
+                    ),
                 )
 
             pp_proxy = PPProxyTensors(proxy_tensors)
