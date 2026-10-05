@@ -697,8 +697,18 @@ class _Chain:
     __slots__ = ("previous", "pending")
 
     def __init__(self, previous):
-        self.previous = _detached(previous)
+        self.previous = _detached(_handed_off(previous))
         self.pending = None
+
+
+def _handed_off(declaration):
+    """A stage whose output crosses to another pipeline rank: an FFN leaves it
+    on the attention's rows, which is what the handoff carries and the next
+    rank's first stage reads, even where it would otherwise stay on this
+    rank's attention-TP slice of them."""
+    if declaration is None or declaration.kind is not StageKind.FFN:
+        return declaration
+    return replace(declaration, exit_rows=ExitRows.ATTENTION)
 
 
 def _detached(declaration):
@@ -716,6 +726,11 @@ def _detached(declaration):
 def _bind_stack(appends, *, previous, following):
     """Bind every appended stage, in order, and fill in the boundaries each
     append returned."""
+    if following is not None:
+        # The last stage hands off to the next rank. A branch reading it binds
+        # earlier than the stage itself, so it is marked before anything binds.
+        last = [append for append in appends if append.prepared_from is None][-1]
+        last.declarations[-1] = _handed_off(last.declarations[-1])
     chain = _Chain(previous)
     # A returned declaration's boundary as bound, for the branches that read it.
     sources = {}

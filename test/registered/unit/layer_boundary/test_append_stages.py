@@ -1,6 +1,7 @@
 """A layer stack connects the stages appended to it in order."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import test_declared_decoder_boundary as fixture
@@ -8,13 +9,21 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.layer_boundary import (
+    BatchVariant,
+    ExitRows,
     ProducerReduction,
     append_stages,
     declare_attn,
     declare_ffn,
     layer_stack,
 )
+from sglang.srt.layers.layer_boundary.ops import (
+    attn_tp_gather_input,
+    keep_output,
+    update_attn_tp_gather_output,
+)
 from sglang.srt.layers.rotary_embedding import factory as rope_factory
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.utils.common import is_building_neighbour_layer, make_layers
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -291,6 +300,69 @@ class TestMakeLayers(CustomTestCase):
             make_layers(NUM_LAYERS, layer_fn, pp_rank=0, pp_size=2)
             added = {key for key in rope_factory._ROPE_DICT if key[0] == "test"}
         self.assertEqual(added, {("test", 0), ("test", 1)})
+
+
+class TestPipelineHandoff(CustomTestCase):
+    """With an a2a MoE over attention TP, an FFN leaves its output on this
+    rank's slice of the rows for the next layer to gather; across a pipeline
+    handoff it returns to the attention's rows, which both ranks agree on."""
+
+    def setUp(self):
+        self.planning = fixture.planning(
+            fixture.parallel_of(attn_dp=1, attn_tp=2),
+            a2a=True,
+            boundary_reduction="ar",
+        )
+        self.planning.__enter__()
+        self.addCleanup(self.planning.__exit__, None, None, None)
+
+    @staticmethod
+    def moe_layer():
+        return append_stages(
+            (declare_attn(), fixture.Norm()),
+            (declare_ffn(sparse=True, next_layer_sparse=True), fixture.Norm()),
+        )
+
+    @staticmethod
+    def path(stage):
+        return stage.plan.paths[BatchVariant.ORDINARY]
+
+    def test_the_sending_rank_returns_to_the_attention_rows(self):
+        with layer_stack(next_layers=[self.moe_layer]):
+            first_attn, first_ffn, second_attn, second_ffn = [
+                s for _ in range(2) for s in self.moe_layer()
+            ]
+        # Within the rank the output stays on the slice, and the next
+        # attention gathers its input.
+        self.assertIs(self.path(first_ffn).output_move, keep_output)
+        self.assertIs(self.path(second_attn).entry.input_move, attn_tp_gather_input)
+        self.assertIs(
+            self.path(second_ffn).output_move.func, update_attn_tp_gather_output
+        )
+
+    def test_the_receiving_rank_reads_the_attention_rows(self):
+        with layer_stack(previous_layers=[self.moe_layer]):
+            attention, _ = self.moe_layer()
+        self.assertIsNone(self.path(attention).entry.input_move)
+        self.assertIs(attention.declaration.previous.exit_rows, ExitRows.ATTENTION)
+
+    def test_the_receiving_rank_takes_the_stream_either_way(self):
+        # A sliced output arrives gathered and written into the stream; an
+        # output already on the attention's rows arrives with its residual.
+        with layer_stack(previous_layers=[self.moe_layer]):
+            attention, _ = self.moe_layer()
+        attention.plan.path_for = lambda _: self.path(attention)
+        hidden, residual = torch.ones(4, 4), torch.full((4, 4), 2.0)
+
+        batch = SimpleNamespace(residual_stream=None)
+        attention.from_pp(PPProxyTensors({"hidden_states": hidden}), batch)
+        self.assertIs(batch.residual_stream.residual, hidden)
+        self.assertIsNone(batch.residual_stream.pending)
+
+        wire = PPProxyTensors({"hidden_states": hidden, "residual": residual})
+        attention.from_pp(wire, batch)
+        self.assertIs(batch.residual_stream.residual, residual)
+        self.assertIs(batch.residual_stream.pending.value, hidden)
 
 
 if __name__ == "__main__":

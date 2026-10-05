@@ -223,13 +223,15 @@ class StageBoundary:
             Tensor or owed handle for prepare. A producer-written residual and a
             declared partial sum are reconstructed from the incoming contract.
         """
+        previous = self.declaration.previous
         hidden_states, residual = from_pp(
             tensors,
-            residual_in_hidden=(
-                self.declaration.previous is not None
-                and self.declaration.previous.update.applied_at_exit
-            ),
-            allow_missing_residual=allow_missing_residual,
+            residual_in_hidden=previous is not None and previous.update.applied_at_exit,
+            # An FFN that hands off from this rank's attention-TP slice of the
+            # rows gathers its output back into the stream, which then arrives
+            # written, without a separate residual.
+            allow_missing_residual=allow_missing_residual
+            or (previous is not None and previous.kind is StageKind.FFN),
         )
         declared_sum = self.entry(forward_batch).declared_sum
         hidden_states, forward_batch.residual_stream = ResidualStream.from_handoff(
