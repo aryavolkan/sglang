@@ -45,6 +45,10 @@ class ExitRows(Enum):
 
     ATTENTION = auto()
     TBO_SPLIT = auto()
+    # The rows the FFN ran on, also at the stack's end: an FFN on this rank's
+    # attention-TP slice leaves its output there, and the final read reads
+    # that slice and gathers what it read.
+    SLICE = auto()
 
 
 class BatchVariant(Enum):
@@ -139,6 +143,8 @@ class EdgeContract(msgspec.Struct, frozen=True):
         arriving_plain_add: Allowed values of ResidualUpdate.is_plain_add for
             arriving contributions. Empty means use produced.update's capability.
             The actual update object travels with the residual stream.
+        arrives_written: Whether the producer applies its update at its exit,
+            so the stream arrives written with no residual add pending.
     """
 
     produced: OutputContract
@@ -150,6 +156,7 @@ class EdgeContract(msgspec.Struct, frozen=True):
     residual_joins_sum: bool = False
     # Capabilities allowed to arrive from another layer, not its update object.
     arriving_plain_add: Tuple[bool, ...] = ()
+    arrives_written: bool = False
 
 
 class FfnInputFusion(msgspec.Struct, frozen=True):
@@ -185,6 +192,9 @@ class ReadoutFusion(msgspec.Struct, frozen=True):
     # rows (a reduce-scatter, given the whole residual or its slice) rather
     # than on every row.
     scatters: bool = False
+    # Whether it also does the read: run(hidden_states, residual,
+    # forward_batch, norm) then returns the read's (input, residual).
+    reads: bool = False
 
 
 class CpMoves(msgspec.Struct, frozen=True):

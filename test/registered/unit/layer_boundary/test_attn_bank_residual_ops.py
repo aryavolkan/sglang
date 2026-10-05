@@ -362,7 +362,7 @@ class TestAttnBankFusedAllReduce(CustomTestCase):
             )
         step = ffn.plan.paths[BatchVariant.ORDINARY].entry.prepare.keywords["step"]
         self.assertIs(step.func, comm_ops._reduce_update_read)
-        self.assertEqual(step.keywords["read_fusions"], (fused.run,))
+        self.assertEqual(step.keywords["read_fusions"], (fused,))
 
     def test_the_fused_stream_reads_as_the_entry_would(self):
         hidden = torch.randn(TOKENS, HIDDEN, generator=torch.Generator().manual_seed(3))
@@ -388,9 +388,7 @@ class TestAttnBankFusedAllReduce(CustomTestCase):
                         LAYER_LIST[1].post_norm,
                         gathers_residual=False,
                         fusions=(),
-                        read_fusions=tuple(
-                            f.run for f in ops.ffn_readout.completing_fusions
-                        ),
+                        read_fusions=ops.ffn_readout.completing_fusions,
                         read=ops.ffn_readout,
                         update=ops.ffn_update,
                     )
@@ -530,7 +528,7 @@ class TestAttnBankSpMoeStages(CustomTestCase):
         path = ffn.plan.paths[BatchVariant.ORDINARY]
         step = path.entry.prepare.keywords["step"]
         self.assertIs(step.func, comm_ops._attn_tp_reduce_scatter_update_read)
-        self.assertEqual(step.keywords["read_fusions"], (scatter_add,))
+        self.assertEqual([f.run for f in step.keywords["read_fusions"]], [scatter_add])
         self.assertIs(path.output_move.func, update_attn_tp_gather_output)
         self.assertIs(path.output_move.keywords["gather"], gather)
 
@@ -612,7 +610,11 @@ class TestAttnBankSpMoeStages(CustomTestCase):
                         None,
                         LAYER_LIST[1].post_norm,
                         scatters_residual=True,
-                        read_fusions=(scatter_add(takes),),
+                        read_fusions=(
+                            ReadoutFusion(
+                                SumGroup.ATTN_TP, scatter_add(takes), scatters=True
+                            ),
+                        ),
                         read=ops.ffn_readout,
                         update=Update(),
                     )

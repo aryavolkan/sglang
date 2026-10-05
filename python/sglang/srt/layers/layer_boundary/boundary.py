@@ -186,6 +186,7 @@ def bind_entry(
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
     attn_input_adapter: Optional[Callable] = None,
+    attn_tp_gather: Optional[Callable] = None,
 ) -> EntryPath:
     """Bind the consumer half of an edge at construction time.
 
@@ -196,6 +197,8 @@ def bind_entry(
         cp_moves: Context-parallel strategy operations for this edge, if needed.
         enters_stack: Whether the read must initialize the stack's residual.
         attn_input_adapter: Hands an attention its input once it is on its rows.
+        attn_tp_gather: The stage's implementation of a gather over attention
+            TP, tried before the default one.
 
     Returns:
         An EntryPath whose prepare accepts the actual update from the stream.
@@ -217,6 +220,11 @@ def bind_entry(
         if edge.produced.update is None:
             raise ValueError("an arrival must declare its update capabilities")
         capabilities = (edge.produced.update.is_plain_add,)
+    gather_input = (
+        attn_tp_gather_input
+        if attn_tp_gather is None
+        else partial(attn_tp_gather_input, gather=attn_tp_gather)
+    )
     paths = {
         capability: _bind_entry_path(
             edge,
@@ -226,6 +234,7 @@ def bind_entry(
             cp_moves=cp_moves,
             enters_stack=enters_stack,
             attn_input_adapter=attn_input_adapter,
+            gather_input=gather_input,
         )
         for capability in capabilities
     }
@@ -253,6 +262,7 @@ def _bind_entry_path(
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
     attn_input_adapter: Optional[Callable] = None,
+    gather_input: Callable = attn_tp_gather_input,
 ) -> EntryPath:
     """The consumer's half of ``edge``, chosen from the edge's declarations and
     the producer's update: what a value carries for a batch (a sum or a handoff
@@ -276,6 +286,8 @@ def _bind_entry_path(
         residual_joins_sum=edge.residual_joins_sum,
         cp_moves=cp_moves,
         enters_stack=enters_stack,
+        gather_input=gather_input,
+        arrives_written=edge.arrives_written,
     )
     completed_step = None
     if edge.produced.always_partial:
@@ -390,7 +402,7 @@ def _read_fusions(read, owes, is_plain_add, *, scatters):
     if not is_plain_add:
         return ()
     return tuple(
-        f.run
+        f
         for f in getattr(read, "completing_fusions", ())
         if f.completes is owes and f.scatters == scatters
     )
@@ -407,6 +419,8 @@ def _select_entry_step(
     residual_joins_sum: bool,
     cp_moves: Optional[CpMoves],
     enters_stack: bool,
+    gather_input: Callable = attn_tp_gather_input,
+    arrives_written: bool = False,
 ) -> Tuple[Callable, Optional[Callable]]:
     """The steps into a stage for a value that is complete or owes the sum its
     producer always leaves, the fused kernels they try first, and the move
@@ -498,7 +512,9 @@ def _select_entry_step(
         return (partial(cp_moves.gather, gather=on_chunk), None)
     if gathered == {TokenAxis.ATTN_TP}:
         # A complete input on each rank's slice, gathered over attention TP
-        # once it is read.
+        # once it is read, unless one of the read's own kernels gathers it.
+        # Those take a pending residual add themselves, so only a plain one,
+        # or none when the producer wrote the stream at its exit.
         if (
             owes is not None
             or residual != residual_to
@@ -511,8 +527,13 @@ def _select_entry_step(
                 pre_move=None,
                 enters_stack=enters_stack,
                 read=read,
+                read_gathers=(
+                    getattr(read, "gathering_reads", ())
+                    if is_plain_add or arrives_written
+                    else ()
+                ),
             ),
-            attn_tp_gather_input,
+            gather_input,
         )
     if (
         residual_to != produced.layout

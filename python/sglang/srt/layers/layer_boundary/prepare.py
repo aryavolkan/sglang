@@ -40,6 +40,7 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
     get_attn_tp_context,
     tp_gather,
 )
+from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
 from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
     _cp_shard_token_rows,
@@ -65,12 +66,32 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
 from sglang.srt.layers.layer_boundary.ops import (
+    GatheredInput,
     attn_tp_all_reduce,
     attn_tp_reduce_scatter,
     dp_gather,
     dp_gather_sum,
     moe_cp_gather,
 )
+
+
+def _run_read_fusions(
+    read_fusions, hidden_states, residual, forward_batch, norm, *, read, **call
+):
+    """The first of the read's own kernels (ReadoutFusion) that takes the
+    batch: one that completes the sum with the residual add hands the written
+    stream to ``read``; one that also reads returns the read. None when every
+    kernel declines."""
+    for fused in read_fusions:
+        if fused.reads:
+            result = fused.run(hidden_states, residual, forward_batch, norm)
+            if result is not None:
+                return result
+            continue
+        stream = fused.run(hidden_states, residual, forward_batch)
+        if stream is not None:
+            return read.read(stream, norm, **call)
+    return None
 
 
 def _reduce_update_read(
@@ -82,7 +103,7 @@ def _reduce_update_read(
     cache=None,
     gathers_residual: bool,
     fusions: Tuple[Callable, ...],
-    read_fusions: Tuple[Callable, ...] = (),
+    read_fusions: Tuple[ReadoutFusion, ...] = (),
     group: SumGroup = SumGroup.ATTN_TP,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
@@ -96,15 +117,18 @@ def _reduce_update_read(
     ``quant_format`` and ``post_residual_addition``)."""
     if gathers_residual:
         residual = update.gather_residual_attn_tp(residual)
-    for fused in read_fusions:
-        stream = fused(hidden_states, residual, forward_batch)
-        if stream is not None:
-            return read.read(
-                stream,
-                norm,
-                quant_format=quant_format,
-                post_residual_addition=post_residual_addition,
-            )
+    result = _run_read_fusions(
+        read_fusions,
+        hidden_states,
+        residual,
+        forward_batch,
+        norm,
+        read=read,
+        quant_format=quant_format,
+        post_residual_addition=post_residual_addition,
+    )
+    if result is not None:
+        return result
     for fused in fusions:
         result = fused(hidden_states, residual, forward_batch)
         if result is not None:
@@ -318,6 +342,7 @@ def _update_read(
     pre_move: Optional[Callable],
     enters_stack: bool,
     read: ResidualReadout,
+    read_gathers: Tuple[Callable, ...] = (),
     update: ResidualUpdate = PLAIN_ADD,
     quant_format: str = "",
     post_residual_addition: Optional[torch.Tensor] = None,
@@ -325,12 +350,19 @@ def _update_read(
     """Complete what the input owes by construction (``pre_move``), then
     write the previous stage's output into the residual and read the stage's
     input with ``norm``. The layer stack's first stage (``enters_stack``)
-    starts its residual from its input."""
+    starts its residual from its input. The read may be one of
+    ``read_gathers``, the read's kernels that also gather what they read over
+    attention TP; the entry's own gather then passes their input on."""
     enters = residual is None and enters_stack
     if pre_move is not None:
         hidden_states, residual = pre_move(hidden_states, residual)
     if enters:
         hidden_states, residual = read.init_residual(hidden_states), None
+    for fused in read_gathers:
+        result = fused(hidden_states, residual, norm)
+        if result is not None:
+            gathered, residual = result
+            return GatheredInput(gathered), residual
     if residual is None:
         # The previous layer already wrote its output into the residual.
         return read.read(hidden_states, norm, quant_format)
@@ -352,17 +384,18 @@ def _attn_tp_reduce_scatter_update_read(
     *,
     cache=None,
     scatters_residual: bool,
-    read_fusions: Tuple[Callable, ...] = (),
+    read_fusions: Tuple[ReadoutFusion, ...] = (),
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
 ):
     """Complete the attention-TP sum onto this rank's slice, unless one of the
     read's ``read_fusions`` does it with the residual add, slice the residual
     the same way, then write the output into it and read the input."""
-    for fused in read_fusions:
-        stream = fused(hidden_states, residual, forward_batch)
-        if stream is not None:
-            return read.read(stream, norm)
+    result = _run_read_fusions(
+        read_fusions, hidden_states, residual, forward_batch, norm, read=read
+    )
+    if result is not None:
+        return result
     hidden_states = attn_tp_reduce_scatter(hidden_states)
     if scatters_residual and residual is not None:
         residual = update.slice_residual_attn_tp(residual)

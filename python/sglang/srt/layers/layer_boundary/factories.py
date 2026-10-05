@@ -317,6 +317,7 @@ def declare_attn(
     reduction=ProducerReduction.ALWAYS_PARTIAL,
     gathers_attn_tp_input=True,
     output_transform=None,
+    attn_tp_gather=None,
 ):
     """Declare attention or a mixer; construct its executable boundary later.
 
@@ -330,6 +331,8 @@ def declare_attn(
             complete, before the residual update (a sandwich norm). The next
             stage's input runs it, so no fused add + norm takes that input.
             Requires ALWAYS_PARTIAL.
+        attn_tp_gather: Implementation of the input's gather over attention
+            TP, tried before the boundary's own (see StageDeclaration).
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -346,6 +349,7 @@ def declare_attn(
         output_transform=output_transform,
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
+        attn_tp_gather=attn_tp_gather,
     )
 
 
@@ -417,8 +421,12 @@ def _resolve_stage(stage, variant, following=None):
             dense_tp_size=stage.dense_tp_size,
             output_complete=stage.output_complete,
         )
-        if resolve_exit_rows(stage.exit_rows) is ExitRows.ATTENTION:
+        exit_rows = resolve_exit_rows(stage.exit_rows)
+        if exit_rows is ExitRows.ATTENTION:
             returned = attention
+        elif exit_rows is ExitRows.SLICE:
+            # The rows the FFN ran on, which an unpadded batch keeps whole.
+            returned = residual
         return declaration, residual, returned
     sp = variant is BatchVariant.SEQUENCE_PARALLEL
     scattered = variant is BatchVariant.INPUT_SCATTERED
@@ -474,7 +482,7 @@ def _connect(producer, consumer, *, residual_from=None):
                 update=None,
             )
             residual = rows
-            capabilities = (True,)
+            capabilities, written = (True,), False
         else:
             decl, during, returned = _resolve_stage(before, variant, following=after)
             if during is None:
@@ -499,6 +507,7 @@ def _connect(producer, consumer, *, residual_from=None):
                 and before.reduction is ProducerReduction.ALWAYS_PARTIAL
             ):
                 arrived, residual, capabilities = decl.output, during, ()
+                written = False
             else:
                 owes = (
                     variant is BatchVariant.INPUT_SCATTERED
@@ -523,6 +532,7 @@ def _connect(producer, consumer, *, residual_from=None):
                     update=None,
                 )
                 residual, capabilities = returned, (before.update.is_plain_add,)
+                written = before.update.applied_at_exit
         if after is None:
             continue
         decl, during, _ = _resolve_stage(after, variant)
@@ -554,6 +564,7 @@ def _connect(producer, consumer, *, residual_from=None):
             during,
             residual_joins_sum=joins,
             arriving_plain_add=capabilities,
+            arrives_written=written,
         )
         entries[variant] = edge
         if (
