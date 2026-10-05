@@ -291,6 +291,19 @@ class RadixAttention(nn.Module):
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
         else:
+            real_num_tokens = _padded_extend_real_tokens(q, forward_batch)
+            if real_num_tokens is not None:
+                return _attention_on_real_rows(
+                    self,
+                    real_num_tokens,
+                    q,
+                    k,
+                    v,
+                    forward_batch,
+                    save_kv_cache,
+                    key_value_num_tokens=key_value_num_tokens,
+                    **kwargs,
+                )
             return get_attn_backend().forward(
                 q,
                 k,
@@ -300,6 +313,84 @@ class RadixAttention(nn.Module):
                 save_kv_cache,
                 **kwargs,
             )
+
+
+def _padded_extend_real_tokens(q: torch.Tensor, forward_batch) -> Optional[int]:
+    """The real rows of an extend batch that MLP sync padded to a multiple of
+    attention TP, whose attention metadata covers only those rows; None for a
+    batch without such padding. Target verify plans its padded rows itself."""
+    mode = forward_batch.forward_mode
+    if not mode.is_extend() or mode.is_target_verify():
+        return None
+    real_num_tokens = getattr(forward_batch, "global_num_token_non_padded_cpu", None)
+    if real_num_tokens is None or not 0 < real_num_tokens < q.shape[0]:
+        return None
+    return real_num_tokens
+
+
+def _attention_on_real_rows(
+    layer,
+    real_num_tokens: int,
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    forward_batch,
+    save_kv_cache: bool,
+    *,
+    key_value_num_tokens: Optional[int] = None,
+    **kwargs,
+):
+    """Run the backend on a padded batch's real rows, with the cache locations
+    and positions narrowed for the call, and return its output padded back
+    with zero rows, as the prefill graph path does. K and V are narrowed with
+    the queries unless the caller gives their own extent (a cached-prefix
+    chunk)."""
+    num_tokens = q.shape[0]
+
+    def queries(t):
+        return t[:real_num_tokens] if t is not None else None
+
+    def keys(t):
+        if t is None or key_value_num_tokens is not None or t.shape[0] != num_tokens:
+            return t
+        return t[:real_num_tokens]
+
+    for name, narrow in (
+        ("q_rope", queries),
+        ("k_rope", keys),
+        ("topk_indices", queries),
+    ):
+        if kwargs.get(name) is not None:
+            kwargs[name] = narrow(kwargs[name])
+    out_cache_loc = forward_batch.out_cache_loc
+    positions = forward_batch.positions
+    forward_batch.out_cache_loc = out_cache_loc[:real_num_tokens]
+    if positions is not None:
+        forward_batch.positions = positions[:real_num_tokens]
+    try:
+        ret = get_attn_backend().forward(
+            queries(q),
+            keys(k),
+            keys(v),
+            layer,
+            forward_batch,
+            save_kv_cache,
+            **kwargs,
+        )
+    finally:
+        forward_batch.out_cache_loc = out_cache_loc
+        forward_batch.positions = positions
+
+    def padded(t):
+        if not isinstance(t, torch.Tensor) or t.shape[0] != real_num_tokens:
+            return t
+        full = t.new_zeros((num_tokens, *t.shape[1:]))
+        full[:real_num_tokens].copy_(t)
+        return full
+
+    if isinstance(ret, tuple):
+        return tuple(padded(t) for t in ret)
+    return padded(ret)
 
 
 def _unified_attention_with_output_impl(
