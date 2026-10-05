@@ -328,10 +328,15 @@ def update_attn_tp_gather_output(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     update: ResidualUpdate = PLAIN_ADD,
+    gather: Optional[Callable] = None,
     **kwargs,
 ):
+    """Write the output into the residual on this rank's slice, then gather it
+    over attention TP: with ``gather``, the stage's own implementation, when it
+    takes the batch."""
     hidden_states = update.update(hidden_states, residual)
-    return attn_tp_gather(hidden_states), None
+    gathered = gather(hidden_states) if gather is not None else None
+    return (attn_tp_gather(hidden_states) if gathered is None else gathered), None
 
 
 def residual_slice_output(

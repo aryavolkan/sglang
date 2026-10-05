@@ -19,6 +19,7 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
     layer_stack,
 )
+from sglang.srt.layers.layer_boundary import ops as comm_moves
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.ops import update_attn_tp_gather_output
 from sglang.srt.layers.layer_boundary.residual import attn_bank
@@ -476,6 +477,148 @@ class TestAttnBankSpMoeStages(CustomTestCase):
                 update=Update(),
             )
         self.assertEqual(reads, [(2, None)])
+
+    def build_with_tuned_collectives(self, *, a2a, scatter_add, gather):
+        ops = AttnBankState(
+            AttnBank(),
+            LAYER_LIST[1].attn_proj,
+            LAYER_LIST[1].attn_score_norm,
+            LAYER_LIST[1].ffn_proj,
+            LAYER_LIST[1].ffn_score_norm,
+            ffn_input_fusions=(
+                ReadoutFusion(SumGroup.ATTN_TP, scatter_add, scatters=True),
+            ),
+        ).residual_ops()
+        with (
+            fixture.planning(
+                fixture.parallel_of(attn_dp=1, attn_tp=2),
+                a2a=a2a,
+                boundary_reduction="ar",
+            ),
+            layer_stack(),
+        ):
+            _, ffn = append_stages(
+                (
+                    declare_attn(read=ops.attn_readout, update=ops.attn_update),
+                    fixture.Norm(),
+                ),
+                (
+                    declare_ffn(
+                        read=ops.ffn_readout,
+                        update=REPLACE_AT_EXIT,
+                        sparse=a2a,
+                        next_layer_sparse=a2a,
+                        output_complete=True,
+                        exit_rows=ExitRows.ATTENTION,
+                        attn_tp_gather=gather,
+                    ),
+                    fixture.Norm(),
+                ),
+            )
+        return ffn
+
+    def test_tuned_collectives_take_the_shard_entry_and_the_exit_gather(self):
+        def scatter_add(hidden_states, residual, forward_batch):
+            return None
+
+        def gather(hidden_states):
+            return None
+
+        ffn = self.build_with_tuned_collectives(
+            a2a=True, scatter_add=scatter_add, gather=gather
+        )
+        path = ffn.plan.paths[BatchVariant.ORDINARY]
+        step = path.entry.prepare.keywords["step"]
+        self.assertIs(step.func, comm_ops._attn_tp_reduce_scatter_update_read)
+        self.assertEqual(step.keywords["read_fusions"], (scatter_add,))
+        self.assertIs(path.output_move.func, update_attn_tp_gather_output)
+        self.assertIs(path.output_move.keywords["gather"], gather)
+
+    def test_a_scattering_kernel_stays_off_an_all_reduce_entry(self):
+        with self.assertRaisesRegex(ValueError, "attention-TP gather"):
+            # Without the a2a slice nothing gathers over attention TP either.
+            self.build_with_tuned_collectives(
+                a2a=False, scatter_add=lambda *a: None, gather=lambda h: None
+            )
+        ffn = self.build_with_tuned_collectives(
+            a2a=False, scatter_add=lambda *a: None, gather=None
+        )
+        step = ffn.plan.paths[BatchVariant.ORDINARY].entry.prepare.keywords["step"]
+        self.assertIs(step.func, comm_ops._reduce_update_read)
+        self.assertEqual(step.keywords["read_fusions"], ())
+
+    def test_the_exit_gather_falls_back_when_its_kernel_declines(self):
+        class Update:
+            def update(self, hidden_states, residual):
+                return hidden_states + 1
+
+        shard = torch.zeros(2, HIDDEN)
+        with patch.object(comm_moves, "attn_tp_gather", lambda h: torch.cat([h, h])):
+            tuned, _ = update_attn_tp_gather_output(
+                shard,
+                None,
+                None,
+                update=Update(),
+                gather=lambda h: torch.full((4, HIDDEN), 7.0),
+            )
+            fallback, _ = update_attn_tp_gather_output(
+                shard, None, None, update=Update(), gather=lambda h: None
+            )
+        torch.testing.assert_close(tuned, torch.full((4, HIDDEN), 7.0))
+        torch.testing.assert_close(fallback, torch.ones(4, HIDDEN))
+
+    def test_the_shard_entry_reads_the_kernels_stream_as_its_own(self):
+        hidden = torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(8))
+        residual = torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(9))
+
+        class Update:
+            is_plain_add = True
+
+            def slice_residual_attn_tp(self, residual):
+                return residual[:2]
+
+        def scatter_add(takes):
+            def run(hidden_states, residual, forward_batch):
+                return hidden_states[:2] + residual[:2] if takes else None
+
+            return run
+
+        results = []
+        for takes in (True, False):
+            holder = AttnBank()
+            holder.open(torch.randn(4, HIDDEN), 2).write(
+                torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(10))
+            )
+            ops = AttnBankState(
+                holder,
+                LAYER_LIST[1].attn_proj,
+                LAYER_LIST[1].attn_score_norm,
+                LAYER_LIST[1].ffn_proj,
+                LAYER_LIST[1].ffn_score_norm,
+            ).residual_ops()
+            with (
+                patch.object(attn_residual, "_mix_fused", _mix),
+                patch.object(comm_ops, "attn_tp_reduce_scatter", lambda h: h[:2]),
+                patch.object(
+                    attn_bank,
+                    "get_parallel",
+                    lambda: SimpleNamespace(attn_tp_size=2, attn_tp_rank=0),
+                ),
+            ):
+                results.append(
+                    comm_ops._attn_tp_reduce_scatter_update_read(
+                        hidden.clone(),
+                        residual.clone(),
+                        None,
+                        LAYER_LIST[1].post_norm,
+                        scatters_residual=True,
+                        read_fusions=(scatter_add(takes),),
+                        read=ops.ffn_readout,
+                        update=Update(),
+                    )
+                )
+        for fused, unfused in zip(*results):
+            torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
 
     def test_without_the_exit_rows_the_residual_stays_on_the_shard(self):
         # What exit_rows changes: by default consecutive MoE layers keep the

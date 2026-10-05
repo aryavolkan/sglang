@@ -7,7 +7,7 @@ import os
 import sys
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
 
 import msgspec
 
@@ -249,6 +249,11 @@ class StageDeclaration:
         output_complete: Whether the FFN's compute completes its own output
             sum, so the exit owes none. For an FFN whose output sum is fused
             with a reduction its computation needs anyway.
+        attn_tp_gather: Optional implementation of the gather over attention
+            TP this stage's boundaries run: given this rank's contiguous slice
+            of the rows, it returns them all, in rank order, or None to leave
+            the gather to the boundary. Checked per batch, so it must be
+            CUDA-graph safe.
         previous: Declaration whose output this stage consumes, as the stack
             records it; across pipeline ranks it is built locally.
         prepared_from: Declaration whose already-read input a branch reuses.
@@ -268,6 +273,7 @@ class StageDeclaration:
     dense_tp_size: Optional[int] = None
     exit_rows: Optional[ExitRows] = None
     output_complete: bool = False
+    attn_tp_gather: Optional[Callable] = None
     # Only declarations participate in construction, never executable stages.
     previous: Optional[StageDeclaration] = None
     prepared_from: Optional[StageDeclaration] = None
@@ -353,6 +359,7 @@ def declare_ffn(
     dense_tp_size=None,
     exit_rows=None,
     output_complete=False,
+    attn_tp_gather=None,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -369,6 +376,8 @@ def declare_ffn(
             the adjacent FFN kinds and TBO configuration.
         output_complete: Whether the compute completes its own output sum,
             fused with a reduction it needs anyway; the exit then owes none.
+        attn_tp_gather: Implementation of the exit's gather over attention TP,
+            tried before the boundary's own (see StageDeclaration).
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -382,6 +391,7 @@ def declare_ffn(
         dense_tp_size=dense_tp_size,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
         output_complete=output_complete,
+        attn_tp_gather=attn_tp_gather,
     )
 
 
