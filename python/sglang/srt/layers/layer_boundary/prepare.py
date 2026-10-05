@@ -82,6 +82,7 @@ def _reduce_update_read(
     cache=None,
     gathers_residual: bool,
     fusions: Tuple[Callable, ...],
+    read_fusions: Tuple[Callable, ...] = (),
     group: SumGroup = SumGroup.ATTN_TP,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
@@ -89,11 +90,21 @@ def _reduce_update_read(
     post_residual_addition: Optional[torch.Tensor] = None,
 ):
     """Complete the sum the input owes over ``group`` on the rows it is on,
-    unless one of ``fusions`` does it with the residual add and the norm, then
-    write it into the residual and read the input (an attention's read takes
+    unless one of ``fusions`` does it with the residual add and the norm, or
+    one of the read's ``read_fusions`` with the residual add, then write it
+    into the residual and read the input (an attention's read takes
     ``quant_format`` and ``post_residual_addition``)."""
     if gathers_residual:
         residual = update.gather_residual_attn_tp(residual)
+    for fused in read_fusions:
+        stream = fused(hidden_states, residual, forward_batch)
+        if stream is not None:
+            return read.read(
+                stream,
+                norm,
+                quant_format=quant_format,
+                post_residual_addition=post_residual_addition,
+            )
     for fused in fusions:
         result = fused(hidden_states, residual, forward_batch)
         if result is not None:

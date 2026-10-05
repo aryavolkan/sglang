@@ -12,6 +12,8 @@ from sglang.srt.layers import attn_residual
 from sglang.srt.layers.layer_boundary import (
     BatchVariant,
     ExitRows,
+    ReadoutFusion,
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -299,6 +301,104 @@ class TestAttnBankResidualOps(CustomTestCase):
             ops.attn_readout.read(
                 self.hidden, LAYER_LIST[0].input_norm, quant_format="fp8"
             )
+
+
+class TestAttnBankFusedAllReduce(CustomTestCase):
+    """A bank's FFN read can supply a kernel that completes the attention
+    output's sum together with the pending residual add on every row; the
+    read then aggregates the stream that kernel wrote."""
+
+    def setUp(self):
+        patcher = patch.object(attn_residual, "_mix_fused", _mix)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def fusion(takes):
+        def run(hidden, residual, forward_batch):
+            if not takes:
+                return None
+            return hidden if residual is None else hidden + residual
+
+        return ReadoutFusion(SumGroup.ATTN_TP, run)
+
+    @staticmethod
+    def ops(bank, fusions):
+        layer = LAYER_LIST[1]
+        return AttnBankState(
+            bank,
+            layer.attn_proj,
+            layer.attn_score_norm,
+            layer.ffn_proj,
+            layer.ffn_score_norm,
+            ffn_input_fusions=fusions,
+        ).residual_ops()
+
+    def test_only_the_ffn_read_supplies_it(self):
+        fused = self.fusion(True)
+        ops = self.ops(AttnBank(), (fused,))
+        self.assertEqual(ops.ffn_readout.completing_fusions, (fused,))
+        self.assertEqual(getattr(ops.attn_readout, "completing_fusions", ()), ())
+
+    def test_the_ffn_entry_tries_it_before_its_all_reduce(self):
+        fused = self.fusion(True)
+        ops = self.ops(AttnBank(), (fused,))
+        with (
+            fixture.planning(
+                fixture.parallel_of(attn_dp=1, attn_tp=2), boundary_reduction="ar"
+            ),
+            layer_stack(),
+        ):
+            _, ffn = append_stages(
+                (
+                    declare_attn(read=ops.attn_readout, update=ops.attn_update),
+                    fixture.Norm(),
+                ),
+                (
+                    declare_ffn(read=ops.ffn_readout, update=ops.ffn_update),
+                    fixture.Norm(),
+                ),
+            )
+        step = ffn.plan.paths[BatchVariant.ORDINARY].entry.prepare.keywords["step"]
+        self.assertIs(step.func, comm_ops._reduce_update_read)
+        self.assertEqual(step.keywords["read_fusions"], (fused.run,))
+
+    def test_the_fused_stream_reads_as_the_entry_would(self):
+        hidden = torch.randn(TOKENS, HIDDEN, generator=torch.Generator().manual_seed(3))
+        residual = torch.randn(
+            TOKENS, HIDDEN, generator=torch.Generator().manual_seed(4)
+        )
+        results = []
+        for takes in (True, False):
+            holder = AttnBank()
+            # A bank with one snapshot, as after the first block.
+            holder.open(torch.randn(TOKENS, HIDDEN), 2).write(
+                torch.randn(TOKENS, HIDDEN, generator=torch.Generator().manual_seed(5))
+            )
+            ops = self.ops(holder, (self.fusion(takes),))
+            with patch.object(
+                comm_ops, "attn_tp_all_reduce", side_effect=lambda h, fb, **kw: h
+            ) as reduce:
+                results.append(
+                    comm_ops._reduce_update_read(
+                        hidden.clone(),
+                        residual.clone(),
+                        None,
+                        LAYER_LIST[1].post_norm,
+                        gathers_residual=False,
+                        fusions=(),
+                        read_fusions=tuple(
+                            f.run for f in ops.ffn_readout.completing_fusions
+                        ),
+                        read=ops.ffn_readout,
+                        update=ops.ffn_update,
+                    )
+                )
+            # Only a kernel that declines the batch leaves the sum to the
+            # boundary's own all-reduce.
+            self.assertEqual(reduce.called, not takes)
+        for fused, unfused in zip(*results):
+            torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
 
 
 class TestAttnBankSpMoeStages(CustomTestCase):
