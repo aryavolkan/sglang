@@ -622,6 +622,12 @@ class KimiK3MoE(nn.Module):
             shared_experts_tp_kwargs = dict(
                 tp_rank=group.rank_in_group, tp_size=group.world_size
             )
+        else:
+            # The TP group _reduce_shared sums over, also where the decoder's
+            # dense MLP is sharded over attention TP.
+            shared_experts_tp_kwargs = dict(
+                tp_rank=parallel.tp_rank, tp_size=parallel.tp_size
+            )
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
             if shared_tp is not None and shared_intermediate_size % shared_tp != 0:
