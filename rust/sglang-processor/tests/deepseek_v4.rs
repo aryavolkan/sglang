@@ -39,7 +39,7 @@ fn deepseek_v4_0731_matches_sglang() {
     for case in fixture["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let (prompt, prefix) = formatter
-            .render_request(&case["request"])
+            .render_request(&case["request"], &Default::default())
             .unwrap_or_else(|error| panic!("{name}: {error}"));
         assert_eq!(
             prompt.clone() + &prefix,

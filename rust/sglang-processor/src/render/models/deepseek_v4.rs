@@ -1,5 +1,7 @@
 //! DeepSeek-V4 prompts as SGLang's `serving_chat.py` builds them, on Dynamo's V4 encoder.
 
+use std::collections::HashMap;
+
 use dynamo_renderer::deepseek::v4::{self, ReasoningEffort, ThinkingMode};
 use serde_json::{Map, Value, json};
 
@@ -16,6 +18,7 @@ pub enum DeepSeekV4Profile {
 pub(crate) fn render(
     profile: DeepSeekV4Profile,
     request: &Value,
+    defaults: &HashMap<String, Value>,
 ) -> Result<(String, String), String> {
     let mut messages = request["messages"]
         .as_array()
@@ -62,20 +65,25 @@ pub(crate) fn render(
     {
         messages[0]["tools"] = normalize_tools(tools)?.into();
     }
-    let mode = if thinking(request) {
+    let mode = if thinking(request, defaults) {
         ThinkingMode::Thinking
     } else {
         ThinkingMode::Chat
     };
-    let prompt =
-        v4::encode_messages_with_options(&messages, mode, true, true, effort(profile, request))
-            .map_err(|error| error.to_string())?;
+    let prompt = v4::encode_messages_with_options(
+        &messages,
+        mode,
+        true,
+        true,
+        effort(profile, request, defaults),
+    )
+    .map_err(|error| error.to_string())?;
     Ok((prompt, prefix))
 }
 
 /// `serving_chat.py`: kwargs `thinking` wins, then any request effort (`!= "none"`),
-/// then `reasoning.enabled`, then `SGLANG_DEFAULT_THINKING`.
-pub(crate) fn thinking(request: &Value) -> bool {
+/// then `reasoning.enabled`, then the server's default kwargs and `SGLANG_DEFAULT_THINKING`.
+pub(crate) fn thinking(request: &Value, defaults: &HashMap<String, Value>) -> bool {
     if let Some(thinking) = request["chat_template_kwargs"].get("thinking") {
         return minijinja::Value::from_serialize(thinking).is_true();
     }
@@ -101,19 +109,30 @@ pub(crate) fn thinking(request: &Value) -> bool {
         }
         _ => false,
     };
-    enabled
-        || std::env::var("SGLANG_DEFAULT_THINKING")
-            .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()))
+    if enabled {
+        return true;
+    }
+    if let Some(thinking) = defaults.get("thinking") {
+        return minijinja::Value::from_serialize(thinking).is_true();
+    }
+    std::env::var("SGLANG_DEFAULT_THINKING")
+        .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()))
 }
 
 /// `encoding_dsv4.REASONING_EFFORT_PROFILES`: kwargs effort replaces the request
-/// effort, `SGLANG_DSV4_REASONING_EFFORT` fills in, and other tiers add no prefix.
-fn effort(profile: DeepSeekV4Profile, request: &Value) -> Option<ReasoningEffort> {
+/// effort, then the server's default kwargs and `SGLANG_DSV4_REASONING_EFFORT`
+/// fill in; other tiers add no prefix.
+fn effort(
+    profile: DeepSeekV4Profile,
+    request: &Value,
+    defaults: &HashMap<String, Value>,
+) -> Option<ReasoningEffort> {
     let requested = [
         &request["chat_template_kwargs"]["reasoning_effort"],
         &request["reasoning"]["effort"],
         &request["reasoning"]["reasoning_effort"],
         &request["reasoning_effort"],
+        defaults.get("reasoning_effort").unwrap_or(&Value::Null),
     ]
     .into_iter()
     .find(|effort| !effort.is_null())
@@ -235,47 +254,50 @@ fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
         .collect()
 }
 
+impl DeepSeekV4Profile {
+    /// `chat_encoding.py`: the config override, else the checkpoint encoder's
+    /// declarations (`encoding/encoding_dsv4.py` source); preview when absent.
+    pub fn from_checkpoint(profile: Option<&str>, encoder: Option<&str>) -> Result<Self, String> {
+        if let Some(profile) = profile {
+            return match profile {
+                "preview" => Ok(Self::Preview),
+                "official" => Ok(Self::Official),
+                _ => Err(format!(
+                    "invalid dsv4_reasoning_effort_profile: {profile:?}; expected \"preview\" or \"official\""
+                )),
+            };
+        }
+        let Some(source) = encoder.filter(|source| source.len() <= 1 << 20) else {
+            return Ok(Self::Preview);
+        };
+        let default = top_level_python_assignment(source, "DEFAULT_REASONING_EFFORT")
+            .and_then(python_string_literal);
+        let prompt_keys = top_level_python_assignment(source, "REASONING_EFFORT_PROMPTS")
+            .and_then(python_dict_keys)
+            .unwrap_or_default();
+        if default.as_deref() == Some("low")
+            && ["low", "high", "max"]
+                .iter()
+                .all(|key| prompt_keys.iter().any(|candidate| candidate == key))
+        {
+            Ok(Self::Official)
+        } else {
+            Ok(Self::Preview)
+        }
+    }
+}
+
 pub(crate) fn resolve_dsv4_profile(
     profile: Option<&str>,
     model_source: &str,
     revision: Option<&str>,
 ) -> Result<DeepSeekV4Profile, String> {
-    if let Some(profile) = profile {
-        return match profile {
-            "preview" => Ok(DeepSeekV4Profile::Preview),
-            "official" => Ok(DeepSeekV4Profile::Official),
-            _ => Err(format!(
-                "invalid dsv4_reasoning_effort_profile: {profile:?}; expected \"preview\" or \"official\""
-            )),
-        };
-    }
-    let Some(encoder) = resolve_model_file(model_source, revision, "encoding/encoding_dsv4.py")
-    else {
-        return Ok(DeepSeekV4Profile::Preview);
-    };
-    let Ok(metadata) = std::fs::metadata(&encoder) else {
-        return Ok(DeepSeekV4Profile::Preview);
-    };
-    if metadata.len() > 1 << 20 {
-        return Ok(DeepSeekV4Profile::Preview);
-    }
-    let Ok(source) = std::fs::read_to_string(encoder) else {
-        return Ok(DeepSeekV4Profile::Preview);
-    };
-    let default = top_level_python_assignment(&source, "DEFAULT_REASONING_EFFORT")
-        .and_then(python_string_literal);
-    let prompt_keys = top_level_python_assignment(&source, "REASONING_EFFORT_PROMPTS")
-        .and_then(python_dict_keys)
-        .unwrap_or_default();
-    if default.as_deref() == Some("low")
-        && ["low", "high", "max"]
-            .iter()
-            .all(|key| prompt_keys.iter().any(|candidate| candidate == key))
-    {
-        Ok(DeepSeekV4Profile::Official)
-    } else {
-        Ok(DeepSeekV4Profile::Preview)
-    }
+    let encoder = profile
+        .is_none()
+        .then(|| resolve_model_file(model_source, revision, "encoding/encoding_dsv4.py"))
+        .flatten()
+        .and_then(|encoder| std::fs::read_to_string(encoder).ok());
+    DeepSeekV4Profile::from_checkpoint(profile, encoder.as_deref())
 }
 
 fn top_level_python_assignment<'a>(source: &'a str, name: &str) -> Option<&'a str> {

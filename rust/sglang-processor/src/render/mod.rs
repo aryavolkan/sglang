@@ -86,23 +86,29 @@ impl ChatFormatter {
                     "chat_template_kwargs": request.chat_template_args(),
                     "continue_final_message": !request.should_add_generation_prompt(),
                 });
-                let (prompt, prefix) = self.render_request(&request)?;
+                let (prompt, prefix) = self.render_request(&request, &HashMap::new())?;
                 Ok(RenderedPrompt::text(prompt + &prefix))
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
         }
     }
 
-    /// Render an SGLang chat request body, returning the prompt and the
+    /// Render an SGLang chat request body under the server's default
+    /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// Only DeepSeek-V4 renders this way; others use [`Self::render_prompt`].
-    pub fn render_request(&self, request: &Value) -> Result<(String, String), TemplateError> {
+    pub fn render_request(
+        &self,
+        request: &Value,
+        default_kwargs: &HashMap<String, Value>,
+    ) -> Result<(String, String), TemplateError> {
         let ChatFormatter::DeepSeekV4(profile) = self else {
             return Err(TemplateError::Renderer {
                 message: "render_request supports DeepSeek-V4 only".into(),
             });
         };
-        render_deepseek_v4(*profile, request).map_err(|message| TemplateError::Renderer { message })
+        render_deepseek_v4(*profile, request, default_kwargs)
+            .map_err(|message| TemplateError::Renderer { message })
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
@@ -132,8 +138,10 @@ impl ChatFormatter {
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
             ChatFormatter::DeepSeekV4(_) => {
-                let enabled =
-                    deepseek_v4_thinking(&serde_json::json!({ "chat_template_kwargs": args }));
+                let enabled = deepseek_v4_thinking(
+                    &serde_json::json!({ "chat_template_kwargs": args }),
+                    &HashMap::new(),
+                );
                 args.get_or_insert_default()
                     .insert("thinking".into(), Value::Bool(enabled));
                 Some(enabled)
